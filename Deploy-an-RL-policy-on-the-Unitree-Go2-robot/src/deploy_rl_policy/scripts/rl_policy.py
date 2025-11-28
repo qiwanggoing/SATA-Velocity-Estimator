@@ -112,7 +112,14 @@ class dataReciever(Node):
             # NEW: History length 11
             self.estimator_history_buffer = collections.deque(maxlen=11)
             self.get_logger().info(f"Velocity estimator loaded successfully. Input dim: 33, History: 11")
-
+        elif use_ground_truth:
+            self.get_logger().info("Using Ground Truth Velocity (Sim)")
+            # 订阅 MuJoCo 发布的真值速度，并绑定到 velocity_callback 更新 base_lin_vel
+            self.velocity_sub = self.create_subscription(
+                TwistStamped,
+                "/mujoco/ground_truth_velocity", 
+                self.velocity_callback,
+                10)
         else:
             self.get_logger().info("Using EKF Estimated Velocity")
             self.velocity_sub = self.create_subscription(
