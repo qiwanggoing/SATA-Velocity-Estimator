@@ -36,9 +36,11 @@ import statistics
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import wandb
 from rsl_rl.algorithms import PPO
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, GRUVelEstimator
 from rsl_rl.env import VecEnv
 
 def copy_code(src_path, dst_path):
@@ -74,6 +76,20 @@ class OnPolicyRunner:
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
+
+        # Velocity Estimator Setup
+        self.estimator = GRUVelEstimator(input_dim=45, 
+                                         temporal_steps=6, 
+                                         gru_hidden_dim=128, 
+                                         mlp_hidden_dims=[64, 16], 
+                                         activation='elu').to(self.device)
+        self.est_optimizer = optim.Adam(self.estimator.parameters(), lr=1e-4) # Adjust LR as needed
+        self.est_criterion = nn.MSELoss()
+        self.history_len = 6
+        self.proprio_dim = 45
+        # History buffer: (num_envs, history_len, proprio_dim)
+        self.obs_history_buffer = torch.zeros(self.env.num_envs, self.history_len, self.proprio_dim, device=self.device)
+
 
         # init storage and model
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs],
@@ -116,6 +132,8 @@ class OnPolicyRunner:
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
+        est_loss_buffer = deque(maxlen=100) # For logging estimator loss
+
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
@@ -123,13 +141,54 @@ class OnPolicyRunner:
         for it in range(self.current_learning_iteration, tot_iter):
             start = time.time()
             # Rollout
-            with torch.inference_mode():
+            # Changed from inference_mode to no_grad to allow enabling grad for estimator
+            with torch.no_grad(): 
                 for i in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs)
+                    # 1. Update Observation History (Proprioception: indices 3 to 48)
+                    proprio_obs = obs[:, 3:48]
+                    # Roll history: Shift left, append new at end
+                    self.obs_history_buffer = torch.cat((self.obs_history_buffer[:, 1:], proprio_obs.unsqueeze(1)), dim=1)
+                    
+                    # 2. Update Estimator (with gradients)
+                    # We must manually enable grad because we are inside torch.no_grad()
+                    with torch.enable_grad():
+                        pred_vel = self.estimator(self.obs_history_buffer)
+                        # Target is ground truth velocity (indices 0 to 3)
+                        target_vel = obs[:, :3].detach() 
+                        est_loss = self.est_criterion(pred_vel, target_vel)
+                        
+                        self.est_optimizer.zero_grad()
+                        est_loss.backward()
+                        self.est_optimizer.step()
+                    
+                    est_loss_buffer.append(est_loss.item())
+
+                    # 3. Prepare Policy Inputs
+                    # Critic sees Ground Truth (use original obs or critic_obs if separate)
+                    # Actor sees Estimated Velocity (replace GT in obs)
+                    
+                    # Ensure critic_obs preserves GT if it was sharing memory with obs
+                    if privileged_obs is None: # critic_obs IS obs
+                        critic_obs_for_act = obs.clone() # Clone to keep GT
+                    else:
+                        critic_obs_for_act = critic_obs # Already separate
+                    
+                    # Inject estimated velocity into obs for Actor
+                    obs_for_act = obs.clone()
+                    obs_for_act[:, :3] = pred_vel.detach()
+                    
+                    # 4. Policy Step
+                    actions = self.alg.act(obs_for_act, critic_obs_for_act)
                     obs, privileged_obs, rewards, dones, infos = self.env.step(actions)
                     critic_obs = privileged_obs if privileged_obs is not None else obs
                     obs, critic_obs, rewards, dones = obs.to(self.device), critic_obs.to(self.device), rewards.to(
                         self.device), dones.to(self.device)
+                    
+                    # 5. Handle History Reset
+                    # Reset history for envs that finished
+                    # Note: self.obs_history_buffer should be reset/zeroed for done envs
+                    self.obs_history_buffer[dones.bool()] = 0
+
                     self.alg.process_env_step(rewards, dones, infos)
 
                     if self.log_dir is not None:
@@ -155,7 +214,10 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
-                self.log(locals())
+                # Add est_loss to locals for logging if needed, or log manually
+                locs = locals()
+                locs['mean_est_loss'] = statistics.mean(est_loss_buffer) if len(est_loss_buffer) > 0 else 0.0
+                self.log(locs)
             if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
             ep_infos.clear()
@@ -188,6 +250,7 @@ class OnPolicyRunner:
 
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
+        self.writer.add_scalar('Loss/estimator', locs.get('mean_est_loss', 0.0), locs['it']) # Log Estimator Loss
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
@@ -195,11 +258,13 @@ class OnPolicyRunner:
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
         self.wbd_writer.log({'Loss/value_function': locs['mean_value_loss'],
                              'Loss/surrogate': locs['mean_surrogate_loss'],
+                             'Loss/estimator': locs.get('mean_est_loss', 0.0),
                              'Loss/learning_rate': self.alg.learning_rate,
                              'Policy/mean_noise_std': mean_std.item(),
                              'Perf/total_fps': fps,
                              'Perf/collection time': locs['collection_time'],
-                             'Perf/learning_time': locs['learn_time']}, step=locs['it'])
+                             'Perf/learning_time': locs['learn_time']},
+                            step=locs['it'])
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), locs['it'])
@@ -215,48 +280,57 @@ class OnPolicyRunner:
         str = f" \033[1m Learning iteration {locs['it']}/{self.current_learning_iteration + locs['num_learning_iterations']} \033[0m "
 
         if len(locs['rewbuffer']) > 0:
-            log_string = (f"""{'#' * width}\n"""
-                          f"""{str.center(width, ' ')}\n\n"""
+            log_string = (f"""{'#' * width}\n""" +
+                          f"""{str.center(width, ' ')}\n\n""" +
                           f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                              'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-                          f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+                              'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n""" +
+                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n""" +
+                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n""" +
+                          f"""{'Estimator loss:':>{pad}} {locs.get('mean_est_loss', 0.0):.4f}\n""" +
+                          f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""" +
+                          f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n""" +
                           f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
         else:
-            log_string = (f"""{'#' * width}\n"""
-                          f"""{str.center(width, ' ')}\n\n"""
+            log_string = (f"""{'#' * width}\n""" +
+                          f"""{str.center(width, ' ')}\n\n""" +
                           f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                              'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
-                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                              'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n""" +
+                          f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n""" +
+                          f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n""" +
+                          f"""{'Estimator loss:':>{pad}} {locs.get('mean_est_loss', 0.0):.4f}\n""" +
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
             #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
-        log_string += (f"""{'-' * width}\n"""
-                       f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
-                       f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-                       f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n"""
+        log_string += (f"""{'-' * width}\n""" +
+                       f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n""" +
+                       f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n""" +
+                       f"""{'Total time:':>{pad}} {self.tot_time:.2f}s\n""" +
                        f"""{'ETA:':>{pad}} {self.tot_time / (locs['it'] + 1) * (
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
         print(log_string)
 
     def save(self, path, infos=None):
+        # Save full checkpoint for resuming training
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
+            'estimator_state_dict': self.estimator.state_dict(), # Save inside checkpoint for resume
             'iter': self.current_learning_iteration,
             'infos': infos,
         }, path)
 
+        # Save separate estimator weights for deployment portability
+        # path is like ".../model_1000.pt", we want ".../estimator_1000.pt"
+        est_path = path.replace('model_', 'estimator_')
+        torch.save(self.estimator.state_dict(), est_path)
+
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        if 'estimator_state_dict' in loaded_dict:
+            self.estimator.load_state_dict(loaded_dict['estimator_state_dict'])
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         self.current_learning_iteration = loaded_dict['iter']

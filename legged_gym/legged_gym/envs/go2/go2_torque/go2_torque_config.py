@@ -34,6 +34,7 @@ from legged_gym.envs.go2.go2_config import GO2RoughCfg, GO2RoughCfgPPO
 
 class GO2TorqueCfg(GO2RoughCfg):
     class env(GO2RoughCfg.env):
+        num_envs = 1024
         num_observations = 60
         num_actions = 12
         episode_length_s = 10

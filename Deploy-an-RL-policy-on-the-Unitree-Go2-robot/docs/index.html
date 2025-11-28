@@ -1,0 +1,113 @@
+@@ -1,55 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Base Velocity Estimator</title>
+  <!-- import MathJax -->
+  <script type="text/javascript"
+    async
+  <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+  <script type="text/javascript" id="MathJax-script" async
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+  </script>
+</head>
+<body>
+  <h1>Base Velocity Estimator</h1>
+  <p>This is an extended Kalman filter using a measurement and a system model:</p>
+
+  <h3>Assumptions</h3>
+  <ul>
+    <li>When foot is in contact with the ground and not slipping, \( \mathbf{v}_{\text{foot}}^w = 0 \)</li>
+    <li>Known:
+      <ul>
+        <li>Joint angles \( \boldsymbol{\theta} \), velocities \( \dot{\boldsymbol{\theta}} \)</li>
+        <li>Angular velocity \( \boldsymbol{\omega}^b \) from IMU</li>
+        <li>Foot position relative to base from forward kinematics</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h3>Equations</h3>
+  <p>Foot velocity from rigid body motion:</p>
+  $$
+  \mathbf{v}_{\text{foot}}^w = \mathbf{v}_{\text{base}}^w + \boldsymbol{\omega}^w \times \mathbf{r}_{\text{foot}}^w + \mathbf{R}_b^w \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}
+  $$
+
+  <p>When the foot is on the ground:</p>
+  $$
+  \mathbf{v}_{\text{base}}^w = - \boldsymbol{\omega}^w \times \mathbf{r}_{\text{foot}}^w - \mathbf{R}_b^w \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}
+  $$
+
+  <p>Transform to base frame:</p>
+  $$
+  \mathbf{v}_{\text{base}}^b = \mathbf{R}_w^b \mathbf{v}_{\text{base}}^w
+  $$
+
+  <p>Final base velocity in base frame:</p>
+  $$
+  \mathbf{v}_{\text{base}}^b = - \boldsymbol{\omega}^b \times \mathbf{r}_{\text{foot}}^b - \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}
+  $$
+
+  <h3>System Model</h3>
+  <p>Updated using integrated IMU acceleration:</p>
+  $$
+  \mathbf{v}_{\text{system}} = \sigma_0^t a_t
+  $$
+
+<h2>Assumptions</h2>
+<ul>
+  <li>When the foot is in contact with the ground and there's no slippage:  
+    <p>$$\mathbf{v}_{\text{foot}}^w = \mathbf{0}$$</p>
+  </li>
+  <li>Known from sensors:
+    <ul>
+      <li>Joint angles $\boldsymbol{\theta}$ and velocities $\dot{\boldsymbol{\theta}}$ (from motor encoders)</li>
+      <li>Angular velocity $\boldsymbol{\omega}^b$ (from IMU)</li>
+      <li>Foot position relative to the base $\mathbf{r}_{\text{foot}}^b$ (computed by forward kinematics)</li>
+    </ul>
+  </li>
+</ul>
+
+<h2>Equations</h2>
+<ol>
+  <li>The velocity of the foot is composed of:
+    <ul>
+      <li>Velocity due to base motion:
+        <p>$$\mathbf{v}_0 = \mathbf{v}_{\text{base}}^w + \boldsymbol{\omega}^w \times \mathbf{r}_{\text{foot}}^w$$</p>
+      </li>
+      <li>Velocity from joint motion:
+        <p>$$\mathbf{v}_1 = \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}$$</p>
+      </li>
+      <li>Total foot velocity in world frame:
+        <p>$$\mathbf{v}_{\text{foot}}^w = \mathbf{v}_{\text{base}}^w + \boldsymbol{\omega}^w \times \mathbf{r}_{\text{foot}}^w + \mathbf{R}_{b}^w \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}$$</p>
+      </li>
+    </ul>
+  </li>
+
+  <li>If the foot is in contact with ground:
+    <p>$$\mathbf{v}_{\text{foot}}^w = \mathbf{0}$$</p>
+    <p>Then:</p>
+    <p>$$\mathbf{v}_{\text{base}}^w = - \boldsymbol{\omega}^w \times \mathbf{r}_{\text{foot}}^w - \mathbf{R}_{b}^w \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}$$</p>
+  </li>
+
+  <li>Transform to base frame:
+    <p>$$\mathbf{v}_{\text{base}}^b = \mathbf{R}_{w}^b \mathbf{v}_{\text{base}}^w$$</p>
+    <p>Which gives:</p>
+    <p>$$\mathbf{v}_{\text{base}}^b = - \boldsymbol{\omega}^b \times \mathbf{r}_{\text{foot}}^b - \mathbf{J}(\boldsymbol{\theta}) \dot{\boldsymbol{\theta}}$$</p>
+  </li>
+</ol>
+
+<h2>System Model</h2>
+<p>The EKF system model predicts base velocity by integrating acceleration from the IMU, which unfortunately tends to drift over time:</p>
+<p>$$\mathbf{v}_{\text{system}} = \sum_{t=0}^T a_t \Delta t$$</p>
+<p>This system model and the measurement model are fused in the EKF to get a more stable and accurate base velocity estimate.</p>
+
+<h2>Using Neural Network</h2>
+<p>It's also possible to estimate the base velocity using a <strong>deep neural network</strong>. By feeding the network with the past few observations as input and training it to predict the current base velocity, you can often achieve even better accuracy than model-based methods.</p>
+
+<p>No need for complex architectures — even a simple <strong>MLP</strong> (Multi-Layer Perceptron) can converge quickly and perform well!</p>
+
+</body>
+</html>
